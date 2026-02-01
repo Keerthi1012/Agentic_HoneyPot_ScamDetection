@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
-from app.agent.controller import handle_agent
+from agent.controller import handle_agent
 
 router = APIRouter(prefix="/api/v1")
 
@@ -28,13 +28,15 @@ class IncomingMessage(BaseModel):
     metadata: Optional[Metadata] = None
 
 class AgentResponse(BaseModel):
-    agentActivated: bool
-    decision: str
-    confidence: float
-    agentStage: Optional[str] = None
-    signals: Optional[list] = None
-    agentReply: Optional[str] = None
-
+    sender: Optional[str] = None
+    status: Optional[str] = None
+    text: Optional[str] = None
+    # agentActivated: bool
+    # decision: str
+    # confidence: float
+    # agentStage: Optional[str] = None
+    # signals: Optional[list] = None
+    # agentReply: Optional[str] = None
 
 # -----------------------------
 # Main Ingress Endpoint
@@ -56,9 +58,7 @@ def ingest_message(payload: IncomingMessage):
 
     result = handle_agent(
         session_id=payload.sessionId,
-        message_text=payload.message.text,
-        conversation_history=payload.conversationHistory,
-        metadata=payload.metadata
+        message=payload.message,
     )
 
     return result

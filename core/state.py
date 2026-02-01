@@ -32,7 +32,8 @@ def init_session(session_id: str):
             "messages": [],          # conversation timeline
             "confidence": 0.0,       # last computed confidence
             "stage": "unknown",      # probing / extraction / benign
-            "intelligence": {}       # extracted scam intel (future)
+            "intels": [],       # extracted scam intel (future)
+            "signals": []
         }
 
 
@@ -51,4 +52,10 @@ def update_session(session_id: str, updates: Dict[str, Any]):
         init_session(session_id)
 
     for key, value in updates.items():
-        _sessions[session_id][key] = value
+        if key not in _sessions[session_id]:
+            _sessions[session_id][key] = []
+
+        if isinstance(_sessions[session_id][key], list):
+            _sessions[session_id][key].append(value)
+        else:
+            _sessions[session_id][key] = value
