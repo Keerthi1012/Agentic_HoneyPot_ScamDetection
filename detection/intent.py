@@ -153,10 +153,11 @@ def detect_intent(text: str) -> Dict:
     print(f"Score: {final_score}")
 
     # Decision bucket
-    if confidence >= 0.7:
+    if final_score >= 0.5:
         decision = "scam"
     else:
         decision = "safe"
+
 
     return {
         "decision": decision,

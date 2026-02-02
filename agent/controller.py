@@ -6,190 +6,237 @@ import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 from typing import List, Optional
-from core.state import init_session, get_session, update_session
 from detection.intent import detect_intent
+from agent.probing_agent import (
+    select_next_goal,
+    build_goal_prompt
+)
+from agent.extraction_agent import extract_and_enrich
+from core.state import (
+    init_session,
+    get_session,
+    increment_message_count,
+    merge_intelligence,
+    get_serializable_intelligence,
+    is_callback_sent,
+    mark_callback_sent
+)
+
+
+BLOCKED_REPLY_PATTERNS = [
+    # customer support references
+    "customer service",
+    "customer care",
+    "helpline",
+    "support number",
+
+    # real-world authority leakage
+    "official website",
+    "official site",
+    "bank website",
+    "check online",
+    "search online",
+    "google",
+
+    # bank / authority references
+    "bank support",
+    "bank help",
+    "contact the bank",
+    "reach out to",
+
+    # resolution / advice language
+    "you should",
+    "please check",
+    "i recommend"
+]
+
+
+
 
 # Load environment variables
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Load SpaCy model
-nlp = spacy.load("en_core_web_sm")
-
 # -------------------------------------------------
 # Main Agent Controller
 # -------------------------------------------------
+def should_stop_extraction(intels: dict, total_msgs: int) -> bool:
+    """
+    Stop ONLY when meaningful intelligence is collected
+    or when conversation is genuinely too long.
+    """
 
-def handle_agent(
-    session_id: str,
-    message: str,
-):
+    payment_found = bool(
+        intels.get("upiIds")
+        or intels.get("bankAccounts")
+        or intels.get("phishingLinks")
+    )
 
-    # -----------------------------
-    # Session initialization
-    # -----------------------------
+    contact_found = bool(intels.get("phoneNumbers"))
+
+    # ✅ PRIMARY STOP: both payment + contact
+    if payment_found and contact_found:
+        return True
+
+    # ✅ SECONDARY SAFETY STOP (very high)
+    # Allows ~6–7 full message turns
+    if total_msgs >= 14:
+        return True
+
+    return False
+
+
+
+def handle_agent(session_id: str, message):
+    # 1. Init session
     init_session(session_id)
     session = get_session(session_id)
 
-    # -----------------------------
-    # Seed conversation history (if provided)
-    # -----------------------------
-    if message:
-        session["messages"].append({
-            "from": message.sender,
-            "text": message.text,
-            "timestamp": message.timestamp.isoformat()
-        })
+    # 2. Save incoming message
+    session["messages"].append({
+        "from": message.sender,
+        "text": message.text,
+        "timestamp": message.timestamp
+    })
+    increment_message_count(session_id)
 
-    # -----------------------------
-    # Intent detection (latest message only)
-    # -----------------------------
+    # 3. Detect intent
     intent_result = detect_intent(message.text)
-
-    confidence = intent_result["confidence"]
     decision = intent_result["decision"]
     signals = intent_result["signals"]
-    intels = extract_intel(message.text)
 
-    # -----------------------------
-    # Agent selection logic
-    # -----------------------------
-    agent_stage = None
-    agent_reply = None
+    # 4. Extract intelligence (STATLESS)
+    extracted_intel = extract_and_enrich(message.text)
 
-    if decision == "scam":
-        agent_stage = "extraction"
-        agent_reply = generate_reply(session["messages"], agent_stage)
+    # 5. Merge intelligence (STATEFUL)
+    merge_intelligence(session_id, extracted_intel)
+
+    # 6. Decide next goal (AFTER MERGE)
+    payment_requested = bool(
+    re.search(r'\b(pay|send|transfer|deposit|₹|\brupees\b|\binr\b)\b', message.text.lower())
+)
+
+
+
+    next_goal = select_next_goal(session["intels"], payment_requested)
+
+    # 7. Decide if honeypot should continue
+    continue_honeypot = (
+        decision == "scam"
+        or session["total_messages"] <= 8
+    )
+
+    if continue_honeypot and not is_callback_sent(session_id):
+
+
+        # Stop condition
+        if should_stop_extraction(session["intels"], session["total_messages"]):
+            if not is_callback_sent(session_id):
+                send_final_callback(
+                    session_id,
+                    get_serializable_intelligence(session_id),
+                    session["total_messages"]
+                )
+                mark_callback_sent(session_id)
+
+            return {
+                "status": "success",
+                "reply": "Okay, I will check and get back later."
+            }
+
+        # Build conversation context
+        context = "\n".join(
+            f"{m['from']}: {m['text']}"
+            for m in session["messages"][-5:]
+        )
+
+        # Generate reply
+        prompt = build_goal_prompt(next_goal, context)
+        agent_reply = generate_reply(prompt)
 
     else:
-        agent_stage = "probing"
-        agent_reply = generate_reply(session["messages"], agent_stage)
+        # Soft probing fallback (keeps honeypot alive)
+        context = "\n".join(
+            f"{m['from']}: {m['text']}"
+            for m in session["messages"][-3:]
+        )
+        prompt = build_goal_prompt("keep_engaged", context)
+        agent_reply = generate_reply(prompt)
 
-    # -----------------------------
-    # Save agent reply to session
-    # -----------------------------
+
+
+    # 10. Save agent reply (ONLY if valid)
     if agent_reply:
         session["messages"].append({
             "from": "agent",
             "text": agent_reply,
-            "timestamp": datetime.datetime.now().replace(microsecond=0).isoformat()
+            "timestamp": datetime.datetime.utcnow().isoformat()
         })
+        increment_message_count(session_id)
 
-    # -----------------------------
-    # Persist session updates
-    # -----------------------------
-    update_session(session_id, {
-        "confidence": confidence,
-        "stage": agent_stage,
-        "signals": signals,
-        "intels": intels
-    })
 
-    total_messages = len(session["messages"])
-    if decision == "scam": 
-        send_final_callback(session_id, intels, total_messages)
+    # 11. Respond
+    return {
+        "status": "success",
+        "reply": agent_reply
+    }
 
-    print(f"Session before sending response back to user: {session}")
-    # -----------------------------
-    # API response
-    # -----------------------------
-    return {"sender": "user", "status": "success", "text": agent_reply}
 
-def generate_reply(history: list, agent_stage: str) -> str:
-    """Generate human-like reply using OpenAI GPT"""
-    # Last 3 messages for context
-    context = "\n".join([f"{m['from']}: {m['text']}" for m in history[-3:]])
-    prompt = ""
-    if agent_stage == "extraction":
-        prompt = f"""You are a confused 65-year-old Indian uncle receiving scam messages. 
-        You are talking with a fraudster who is trying to loot money through scamming. 
-        Your task now is to extract as much of information about the fraudster without informing that you already figured out the fraud.
-        
-    Conversation history:
-    {context}
 
-    Rules:
-    - Act confused but cooperative
-    - Ask innocent questions to extract more info (UPI, bank details, links, PII information)
-    - Use simple Indian English with minor typos
-    - NEVER mention "scam", "fraud", or detection or similar words.
-    - Keep replies short (1-2 sentences) with little bit of panic in the response message.
-
-    Your reply:"""
-    
-    else:
-        prompt = f"""You are a confused 65-year-old Indian uncle receiving scam messages.
-        
-    Conversation history:
-    {context}
-
-    Rules:
-    - Act confused but cooperative
-    - Ask innocent questions to extract more info (UPI, bank details, links)
-    - Use simple Indian English with minor typos
-    - NEVER mention "scam", "fraud", or detection
-    - Keep replies short (1-2 sentences)
-
-    Your reply:"""
-
+def generate_reply(prompt: str) -> str:
+    """
+    Generate a human-like reply using OpenAI.
+    The controller already decided WHAT to ask.
+    This function only handles language generation.
+    """
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Cheap & fast
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a confused elderly Indian user engaging with scammers to extract information."},
-                {"role": "user", "content": prompt}
+                        {
+                        "role": "system",
+                        "content": (
+                            "You are a normal older Indian person replying casually to a message that is confusing and worrying. "
+                            "You are NOT dramatic, NOT emotional, and NOT explaining feelings. "
+                            "You speak plainly and briefly, like real SMS replies. "
+                            "You are confused and want clarification. "
+                            "You ask simple questions like 'why', 'what is this', 'what do you want me to do'. "
+                            "You always reply directly to the sender using 'you'. "
+                            "You never comfort the other person. "
+                            "You never narrate thoughts or emotions. "
+                            "You never use third-person words like 'they' or 'these people'. "
+                            "Keep replies to 1 short sentence, maximum 2. "
+                            "Never mention scam, fraud, police, banks, or advice."
+                        )
+                    },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
             ],
-            max_tokens=60,
-            temperature=0.8  # Creative but controlled
+            max_tokens=120,
+            temperature=0.8
         )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        # Fallback if OpenAI fails
-        print(f"OpenAI error: {e}")
-        return "Why do you need my UPI ID sir ?"
-    
-def extract_intel(text: str) -> dict:
-    text = text.lower()
-    
-    """Extract URLs using SpaCy's built-in URL detection + custom patterns"""
-    doc = nlp(text)
 
-    # FIXED: Better phishing URL patterns (handles [url], (url), bare urls)
-    phishing_links = []
+        reply = response.choices[0].message.content.strip()
+        reply_lower = reply.lower()
+
+        if any(pat in reply_lower for pat in BLOCKED_REPLY_PATTERNS):
+            return (
+                "I am very worried now and not understanding. "
+                "Please tell me clearly what YOU want me to do."
+            )
+
+        return reply
+
+
+
+    except Exception as e:
+        print(f"OpenAI error: {e}")
+        return "I am little confused, can you explain again?"
+
+
     
-    # 1. SpaCy's native URL detection (token.like_url)
-    for token in doc:
-        if token.like_url:
-            phishing_links.append(token.text)
-    
-    # 2. Enhanced extraction for bracketed/parenthesized URLs
-    bracketed_urls = re.findall(r'\[([^\]]*(?:http|www)[^\]]*)\]|https?://[^\s<>"]+|www\.[^\s<>"]+', text)
-    phishing_links.extend(bracketed_urls)
-    
-    # 3. Remove duplicates and filter valid links
-    unique_links = list(set([link.strip('[]()<>') for link in phishing_links if len(link) > 5]))
-    
-    # FIXED: Better UPI patterns (handles @okhdfcbank, @paytm, etc.)
-    upi_patterns = [
-        r'\b([a-z][a-z0-9]*@[a-z0-9]{4,15})\b',      # ✅ ramu@okhdfcbank (word boundary)
-        r'\b([a-z0-9]{3,}@paytm)\b',                 # ✅ rahul@paytm
-        r'\b([a-z0-9]{3,}@phonepe)\b',               # ✅ user@phonepe
-        r'\b([a-z0-9]{3,}@[a-z]+bank)\b',     
-    ]
-    upi_ids = []
-    for pattern in upi_patterns:
-        upi_ids.extend(re.findall(pattern, text))
-    
-    intel = {
-        "bankAccounts": re.findall(r'\b\d{4}-\d{4}-\d{4}\b', text),  # XXXX-XXXX-XXXX
-        "upiIds": list(set(upi_ids)),                                # Remove duplicates
-        "phishingLinks": list(set([link for link in unique_links if 'http' in link or 'www' in link])),
-        "phoneNumbers": re.findall(r'\+91\d{10}|\d{10}', text),
-        "suspiciousKeywords": ['urgent', 'verify', 'blocked', 'immediately', 'suspension']
-    }
-    
-    # Filter non-empty
-    return {k: v for k, v in intel.items() if v}
 
 def send_final_callback(session_id: str, intel: dict, total_messages: int):
     """Send final intelligence report to GUVI evaluation endpoint"""
@@ -211,3 +258,5 @@ def send_final_callback(session_id: str, intel: dict, total_messages: int):
         print(f"✅ GUVI callback sent: {response.status_code}")
     except Exception as e:
         print(f"❌ GUVI callback failed: {e}")
+
+
