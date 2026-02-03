@@ -28,9 +28,9 @@ class IncomingMessage(BaseModel):
     metadata: Optional[Metadata] = None
 
 class AgentResponse(BaseModel):
-    sender: Optional[str] = None
-    status: Optional[str] = None
-    text: Optional[str] = None
+    status: str
+    reply: str
+
     # agentActivated: bool
     # decision: str
     # confidence: float
